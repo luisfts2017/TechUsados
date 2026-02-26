@@ -20,6 +20,14 @@ const P = require("pino");
 const fs = require("fs");
 const path = require("path");
 
+process.on("uncaughtException", (err) => {
+  try { log(`💥 [UNCAUGHT EXCEPTION] ${err.message}\n${err.stack}`); } catch (_) {}
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  try { log(`💥 [UNHANDLED REJECTION] ${reason}`); } catch (_) {}
+});
+
 // ══════════════════════════════════════════════════════════════
 //  📝  LOG EM ARQUIVO
 // ══════════════════════════════════════════════════════════════
@@ -33,10 +41,9 @@ function log(msg) {
                         .split("/").reverse().join("-"); // AAAA-MM-DD
   const linha    = `[${dataHora}] ${msg}`;
   console.log(linha);
-  try {
-    fs.appendFileSync(path.join(DIR_LOGS, 
-    `${dataArq}.txt`), linha + "\n");
-  } catch (e) { /* ignora erro de escrita */ }
+  fs.appendFile(path.join(DIR_LOGS, `${dataArq}.txt`), linha + "\n", (e) => {
+    if (e) console.error(`[log] Erro ao gravar log: ${e.message}`);
+  });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -159,6 +166,15 @@ function salvarSessao() {
   } catch (e) {
     log(`⚠️  Erro ao salvar sessão: ${e.message}`);
   }
+}
+
+let _salvarDebounceTimer = null;
+function salvarSessaoDebounced() {
+  if (_salvarDebounceTimer) return;
+  _salvarDebounceTimer = setTimeout(() => {
+    _salvarDebounceTimer = null;
+    salvarSessao();
+  }, 5000);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -366,6 +382,7 @@ function redirecionarParaHumano(numero) {
 //  ⏱️  VERIFICADOR PERIÓDICO — libera clientes com timer expirado
 // ══════════════════════════════════════════════════════════════
 let _verificadorAtivo = false;
+let _lastDailyCleanup = new Date().toDateString();
 
 function iniciarVerificadorPeriodico() {
   if (_verificadorAtivo) return;
@@ -394,6 +411,43 @@ function iniciarVerificadorPeriodico() {
         conversasIniciadas.delete(numero);
         // FIX #2: remove do avisadoMidia também ao expirar conversa
         avisadoMidia.delete(numero);
+      }
+    }
+
+    // Limpeza de histórico GPT de clientes inativos há mais de 2h
+    const doisHoras = 2 * 60 * 60 * 1000;
+    for (const numero of Object.keys(historico)) {
+      const ultima = dadosCliente[numero]?.ultimaInteracao;
+      if (ultima && agora - ultima > doisHoras && !aguardandoHumano.has(numero)) {
+        delete historico[numero];
+      }
+    }
+
+    // Limpeza de contadorMensagens expirados
+    for (const [numero, entry] of contadorMensagens) {
+      if (agora - entry.desde > RATE_LIMIT_SECS * 1000) {
+        contadorMensagens.delete(numero);
+      }
+    }
+
+    // Limpeza diária de avisadoForaHorario e dadosCliente (90 dias)
+    const hoje = new Date().toDateString();
+    if (hoje !== _lastDailyCleanup) {
+      _lastDailyCleanup = hoje;
+      avisadoForaHorario.clear();
+
+      const noventaDias = 90 * 24 * 60 * 60 * 1000;
+      let dadosRemovidos = 0;
+      for (const numero of Object.keys(dadosCliente)) {
+        const ultima = dadosCliente[numero]?.ultimaInteracao || 0;
+        if (ultima > 0 && agora - ultima > noventaDias) {
+          delete dadosCliente[numero];
+          delete etapaCliente[numero];
+          dadosRemovidos++;
+        }
+      }
+      if (dadosRemovidos > 0) {
+        log(`🧹 Limpeza diária: ${dadosRemovidos} cliente(s) removido(s) por inatividade (>90 dias)`);
       }
     }
 
@@ -479,7 +533,7 @@ async function processarComandoAdmin(msg, texto) {
 async function processarMensagem(numero, texto) {
   let etapa = etapaCliente[numero] || "novo";
   const dados = dadosCliente[numero] || {};
-  const textoN = texto.trim();
+  const textoN = texto.trim().slice(0, 2000);
   const textoL = textoN.toLowerCase();
 
   const AGORA = Date.now();
@@ -495,7 +549,7 @@ async function processarMensagem(numero, texto) {
   if (["menu", "inicio", "início", "voltar", "0"].includes(textoL) && etapa !== "novo") {
     etapaCliente[numero] = "menu";
     historico[numero] = [];
-    salvarSessao();
+    salvarSessaoDebounced();
     return menuPrincipal(dados.nome || "");
   }
 
@@ -504,7 +558,7 @@ async function processarMensagem(numero, texto) {
     if (dados.nome) {
       etapaCliente[numero] = "menu";
       historico[numero] = [];
-      salvarSessao();
+      salvarSessaoDebounced();
       log(`\n🔄 Cliente antigo retornou: ${dados.nome} | WA: ${numero.replace("@s.whatsapp.net", "")}\n`);
       return (
         `Olá, *${dados.nome}*! Que bom ter você de volta à *Infohouse Informática*. 👋\n\n` +
@@ -521,7 +575,7 @@ async function processarMensagem(numero, texto) {
       etapaCliente[numero] = "coletando_nome";
       dadosCliente[numero] = { ...dados, primeiraMensagem: textoN };
       historico[numero] = [];
-      salvarSessao();
+      salvarSessaoDebounced();
       return (
         `Olá! Seja bem-vindo(a) à *Infohouse Informática*. 👋\n\n` +
         `Sou a *LIA*, sua Atendente Virtual, e estou aqui para ajudá-lo(a)!\n\n` +
@@ -565,7 +619,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
     dadosCliente[numero] = { ...dados, nome, primeiraMensagem: undefined };
     etapaCliente[numero] = "menu";
-    salvarSessao();
+    salvarSessaoDebounced();
 
     log(`\n📋 Novo cliente: ${nome} | WA: ${numero.replace("@s.whatsapp.net", "")}\n`);
 
@@ -587,7 +641,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
     if (opcao === "1") {
       etapaCliente[numero] = "orcamento";
-      salvarSessao();
+      salvarSessaoDebounced();
       return (
         `*Solicitação de Orçamento* 💻\n\n` +
         `Com prazer! Para agilizar seu atendimento, por favor me informe:\n\n` +
@@ -598,7 +652,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
     if (opcao === "2") {
       etapaCliente[numero] = "problema";
-      salvarSessao();
+      salvarSessaoDebounced();
       return (
         `*Suporte Técnico* 🔧\n\n` +
         `Lamento que esteja com dificuldades! Vou ajudá-lo(a).\n\n` +
@@ -612,7 +666,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
     // para garantir que o cliente receba a resposta mesmo com a guarda dupla ativa.
     if (opcao === "3") {
       etapaCliente[numero] = "status";
-      salvarSessao();
+      salvarSessaoDebounced();
       // Retorna primeiro; o redirecionamento é feito no handler externo após o envio
       return (
         `*Status do Equipamento* 🔍\n\n` +
@@ -625,7 +679,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
     if (opcao === "4") {
       etapaCliente[numero] = "agendamento";
-      salvarSessao();
+      salvarSessaoDebounced();
       return (
         `*Agendamento de Visita* 📅\n\n` +
         `Ficamos felizes em recebê-lo(a) na loja!\n\n` +
@@ -641,7 +695,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
     if (opcao === "5") {
       etapaCliente[numero] = "atendendo";
-      salvarSessao();
+      salvarSessaoDebounced();
       return (
         `*Informações Gerais* ℹ️\n\n` +
         `📍 *Endereço:*\n${EMPRESA.endereco}\n\n` +
@@ -691,7 +745,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
   if (["orcamento", "problema"].includes(etapa) && !dados.equipamento) {
     dadosCliente[numero] = { ...dados, equipamento: textoN.slice(0, 80) };
-    salvarSessao();
+    salvarSessaoDebounced();
   }
 
   const resposta = await chamarGPT(numero, textoN, contexto);
@@ -700,9 +754,9 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
   // retorna ao menu para evitar que o cliente fique preso na etapa "atendendo"
   // indefinidamente. A etapa muda para "menu" somente após a primeira resposta
   // satisfatória, sinalizando que o tópico principal foi tratado.
-  if (["orcamento", "agendamento", "problema"].includes(etapa)) {
+  if (["orcamento", "agendamento", "problema", "atendendo"].includes(etapa)) {
     etapaCliente[numero] = "menu";
-    salvarSessao();
+    salvarSessaoDebounced();
   }
 
   return resposta;
@@ -783,6 +837,11 @@ async function iniciarBot() {
     const texto =
       msg.message?.conversation ||
       msg.message?.extendedTextMessage?.text ||
+      msg.message?.buttonsResponseMessage?.selectedDisplayText ||
+      msg.message?.listResponseMessage?.title ||
+      msg.message?.imageMessage?.caption ||
+      msg.message?.videoMessage?.caption ||
+      msg.message?.documentMessage?.caption ||
       null;
 
     const hora = new Date().toLocaleTimeString("pt-BR");
@@ -834,10 +893,8 @@ async function iniciarBot() {
           text:
             `Olá! Sou a *LIA*, Atendente Virtual da *Infohouse Informática*. 😊\n\n` +
             `Recebemos sua mensagem! Para conteúdos como *fotos e áudios*, ` +
-            `vou direcionar você para um de nossos atendentes.
-
-` +
-            `⏳ Por favor, *aguarde um momento*. Em breve alguém irá atendê-lo(a) por aqui. 🙏",
+            `vou direcionar você para um de nossos atendentes.\n\n` +
+            `⏳ Por favor, *aguarde um momento*. Em breve alguém irá atendê-lo(a) por aqui. 🙏`,
         });
       }
       log(`📎 [${hora}] ${fmt} enviou mídia — redirecionado para atendente humano`);
@@ -861,8 +918,6 @@ async function iniciarBot() {
     avisadoForaHorario.delete(numero);
 
     try {
-      await sock.sendPresenceUpdate("composing", numero);
-
       const resposta = await processarMensagem(numero, texto);
 
       // ── Guarda dupla: verifica se humano assumiu durante processamento
@@ -880,6 +935,7 @@ async function iniciarBot() {
         redirecionarParaHumano(numero);
       }
 
+      await sock.sendPresenceUpdate("composing", numero);
       const delay = Math.min(Math.max(resposta.length * 25, 1000), 5000);
       await new Promise(r => setTimeout(r, delay));
 
@@ -910,5 +966,16 @@ async function iniciarBot() {
   });
 }
 
+function encerrarGracioso(sinal) {
+  log(`\n🛑 Sinal ${sinal} recebido — encerrando LIA...`);
+  try { salvarSessao(); } catch (_) {}
+  process.exit(0);
+}
+process.on("SIGINT",  () => encerrarGracioso("SIGINT"));
+process.on("SIGTERM", () => encerrarGracioso("SIGTERM"));
+
 log("\n🤖 Iniciando LIA — Infohouse Informática...\n");
-iniciarBot();
+iniciarBot().catch((err) => {
+  log(`❌ Falha crítica ao iniciar o bot: ${err.message}`);
+  process.exit(1);
+});
