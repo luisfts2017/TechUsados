@@ -1,7 +1,9 @@
 // ╔══════════════════════════════════════════════════════════════╗
 // ║         LIA — Atendente Virtual | Infohouse Informática      ║
 // ║         WhatsApp Bot  •  Baileys + OpenAI GPT-4o-mini        ║
-// ║         v4.2 — Auditoria linha a linha: rate limit ativo, log completo, erros inteligentes      ║
+// ║         v4.3 — Correções: prompt completo, avisadoMidia,     ║
+// ║                race condition status, histórico, menu livre,  ║
+// ║                retorno ao menu GPT, JSON atômico             ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 require("dotenv").config();
@@ -32,7 +34,8 @@ function log(msg) {
   const linha    = `[${dataHora}] ${msg}`;
   console.log(linha);
   try {
-    fs.appendFileSync(path.join(DIR_LOGS, `${dataArq}.txt`), linha + "\n");
+    fs.appendFileSync(path.join(DIR_LOGS, 
+    `${dataArq}.txt`), linha + "\n");
   } catch (e) { /* ignora erro de escrita */ }
 }
 
@@ -40,24 +43,21 @@ function log(msg) {
 //  ⚙️  CONFIGURAÇÕES — edite aqui
 // ══════════════════════════════════════════════════════════════
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // ← definida no arquivo .env
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_API_KEY) {
-  // Usa console.error aqui pois log() ainda não está disponível antes da inicialização
   const msgChave = "❌ OPENAI_API_KEY não encontrada! Crie o arquivo .env com a chave.";
   console.error(msgChave);
-  try { require("fs").appendFileSync(require("path").join(__dirname, "logs", `erro-inicializacao.txt`), `[${new Date().toISOString()}] ${msgChave}\n`); } catch (_) {}
+  try { fs.appendFileSync(path.join(DIR_LOGS, "erro-inicializacao.txt"),
+  `[${new Date().toISOString()}] ${msgChave}\n`); } catch (_) {}
   process.exit(1);
 }
-const MINUTOS_COM_HUMANO = 60; // tempo que a LIA fica pausada após redirecionar
+const MINUTOS_COM_HUMANO = 60;
 
 // Horário comercial (24h)
 const HORARIO = { abertura: 8, fechamento: 18, diasUteis: [1, 2, 3, 4, 5] };
 
-// Fora do horário: true  = LIA avisa e AGUARDA (você pode assumir manualmente)
-//                 false = LIA responde normalmente 24h
 const PAUSAR_FORA_DO_HORARIO = true;
 
-// Arquivo de persistência (salva estado entre reinicializações)
 const ARQUIVO_SESSAO = "sessao_clientes.json";
 
 const EMPRESA = {
@@ -96,13 +96,11 @@ function carregarSessao() {
   try {
     if (fs.existsSync(ARQUIVO_SESSAO)) {
       const raw = JSON.parse(fs.readFileSync(ARQUIVO_SESSAO, "utf8"));
-      // Restaura aguardandoHumano apenas se o timer ainda não expirou
       const agora = Date.now();
       const aguardando = new Map();
       for (const [num, ts] of Object.entries(raw.aguardandoHumano || {})) {
         if (ts > agora) aguardando.set(num, ts);
       }
-      // Restaura conversasIniciadas como Map e descarta entradas expiradas
       const conversas = new Map();
       for (const [num, ts] of Object.entries(raw.conversasIniciadas || {})) {
         if (ts > agora) conversas.set(num, ts);
@@ -117,26 +115,7 @@ function carregarSessao() {
   } catch (e) {
     log(`⚠️  Erro ao carregar sessão: ${e.message}`);
   }
-  return { etapaCliente: {}, dadosCliente: {}, aguardandoHumano: new Map(), conversasIniciadas: new Map() }; // FIX 4
-}
-
-function salvarSessao() {
-  try {
-    // Remove conversas já expiradas antes de salvar
-    const agora = Date.now();
-    for (const [num, ts] of conversasIniciadas) {
-      if (ts < agora) conversasIniciadas.delete(num);
-    }
-    const payload = {
-      etapaCliente,
-      dadosCliente,
-      aguardandoHumano: Object.fromEntries(aguardandoHumano),
-      conversasIniciadas: Object.fromEntries(conversasIniciadas), // Map → objeto JSON
-    };
-    fs.writeFileSync(ARQUIVO_SESSAO, JSON.stringify(payload, null, 2));
-  } catch (e) {
-    log(`⚠️  Erro ao salvar sessão: ${e.message}`);
-  }
+  return { etapaCliente: {}, dadosCliente: {}, aguardandoHumano: new Map(), conversasIniciadas: new Map() };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -147,38 +126,57 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 const sessao = carregarSessao();
 
-const historico = {};           // histórico GPT por número (em memória apenas)
-const aguardandoHumano = sessao.aguardandoHumano;
-const etapaCliente = sessao.etapaCliente;
-const dadosCliente = sessao.dadosCliente;
-const avisadoForaHorario = new Set();   // evita repetir aviso fora do horário
-const conversasIniciadas = sessao.conversasIniciadas || new Map(); // número → timestamp de expiração
-const avisadoMidia = new Set();   // números que já receberam aviso de mídia
+const historico = {};
+const aguardandoHumano   = sessao.aguardandoHumano;
+const etapaCliente       = sessao.etapaCliente;
+const dadosCliente       = sessao.dadosCliente;
+const avisadoForaHorario = new Set();
+const conversasIniciadas = sessao.conversasIniciadas || new Map();
+const avisadoMidia       = new Set();
 
-// Referência global do socket (para comando #liberar)
 let sockGlobal = null;
+
+// ══════════════════════════════════════════════════════════════
+//  💾  SALVAR SESSÃO — escrita atômica via arquivo temporário
+//  FIX #7: renameSync é atômico no mesmo filesystem, evita
+//  corrupção do JSON em caso de queda durante writeFileSync.
+// ══════════════════════════════════════════════════════════════
+function salvarSessao() {
+  try {
+    const agora = Date.now();
+    for (const [num, ts] of conversasIniciadas) {
+      if (ts < agora) conversasIniciadas.delete(num);
+    }
+    const payload = {
+      etapaCliente,
+      dadosCliente,
+      aguardandoHumano: Object.fromEntries(aguardandoHumano),
+      conversasIniciadas: Object.fromEntries(conversasIniciadas),
+    };
+    const tmpFile = ARQUIVO_SESSAO + ".tmp";
+    fs.writeFileSync(tmpFile, JSON.stringify(payload, null, 2));
+    fs.renameSync(tmpFile, ARQUIVO_SESSAO); // FIX #7: atômico
+  } catch (e) {
+    log(`⚠️  Erro ao salvar sessão: ${e.message}`);
+  }
+}
 
 // ══════════════════════════════════════════════════════════════
 //  🛡️  RATE LIMITING — proteção anti-flood
 // ══════════════════════════════════════════════════════════════
-const RATE_LIMIT_MAX  = 8;   // máximo de mensagens
-const RATE_LIMIT_SECS = 60;  // em X segundos
-const contadorMensagens = new Map(); // número → { count, desde }
+const RATE_LIMIT_MAX  = 8;
+const RATE_LIMIT_SECS = 60;
+const contadorMensagens = new Map();
 
 function verificarRateLimit(numero) {
   const agora  = Date.now();
   const entry  = contadorMensagens.get(numero);
-
   if (!entry || (agora - entry.desde) > RATE_LIMIT_SECS * 1000) {
-    // Janela nova
     contadorMensagens.set(numero, { count: 1, desde: agora });
-    return false; // não bloqueado
+    return false;
   }
-
   entry.count++;
-  if (entry.count > RATE_LIMIT_MAX) {
-    return true; // BLOQUEADO
-  }
+  if (entry.count > RATE_LIMIT_MAX) return true;
   return false;
 }
 
@@ -187,7 +185,6 @@ function verificarRateLimit(numero) {
 // ══════════════════════════════════════════════════════════════
 
 function dentroDoHorario() {
-  // Usa timezone de Brasília (BRT/BRST) para evitar problemas em servidores com UTC
   const agora = new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" });
   const data = new Date(agora);
   const hora = data.getHours();
@@ -277,11 +274,12 @@ CONTEXTO: Cliente quer agendar visita à loja.
 - Confirme os dados coletados (nome, telefone, equipamento, dia/hora preferido).
 - Diga que confirmaremos o agendamento por aqui mesmo.`,
 
+    // FIX #1: Regra crítica off-topic COMPLETA — não truncada
     geral: base + `
 CONTEXTO: Atendimento geral.
 - Responda APENAS sobre serviços, políticas e informações da Infohouse Informática.
 - NUNCA explique procedimentos técnicos detalhados (ex: como formatar, como instalar, como consertar).
-- 🛑 REGRA CRÍTICA OFF-TOPIC: Se o cliente falar sobre qualquer coisa fora do escopo da loja (assuntos aleatórios, jogos, receitas, política, etc.), RECUSE educadamente dizendo que você é apenas a assistente da Infohouse e corte o assunto. NÃO "entre na brincadeira".
+- 🛑 REGRA CRÍTICA OFF-TOPIC: Se o cliente falar sobre qualquer coisa fora do escopo da loja (assuntos aleatórios, jogos, receitas, política, esportes, etc.), RECUSE educadamente dizendo que você é apenas a Atendente Virtual da Infohouse Informática e só pode ajudar com assuntos relacionados aos serviços da loja.
 - Se perguntarem sobre procedimentos técnicos, informe que o diagnóstico é presencial na loja.
 - Se a pergunta para a loja for muito complexa, não invente: use a palavra "redirecionar" para acionar atendente humano.`,
   };
@@ -298,7 +296,6 @@ async function chamarGPT(numero, texto, contexto = "geral") {
   historico[numero].push({ role: "user", content: texto });
   if (historico[numero].length > 10) historico[numero] = historico[numero].slice(-10);
 
-  // ── TIMEOUT DE 15 SEGUNDOS na chamada GPT ───────────────────
   const controller = new AbortController();
   const timeoutId  = setTimeout(() => controller.abort(), 15000);
 
@@ -319,8 +316,7 @@ async function chamarGPT(numero, texto, contexto = "geral") {
     resposta = res.choices[0].message.content;
   } catch (e) {
     if (e.name === "AbortError" || e.code === "ERR_ABORTED") {
-      log(`⏱️  [GPT TIMEOUT] ${numero.replace("@s.whatsapp.net","")} — resposta demorou >15s`);
-      // Remove a mensagem do histórico pois não foi respondida
+      log(`⏱️  [GPT TIMEOUT] ${numero.replace("@s.whatsapp.net"," ")} — resposta demorou >15s`);
       historico[numero].pop();
       return (
         "Desculpe, estou com lentidão no momento. 😕\n\n" +
@@ -328,7 +324,7 @@ async function chamarGPT(numero, texto, contexto = "geral") {
         "escolha *6️⃣ Falar com atendente* para atendimento imediato. 🙏"
       );
     }
-    throw e; // relança outros erros para o catch externo
+    throw e;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -347,7 +343,7 @@ async function chamarGPT(numero, texto, contexto = "geral") {
 // ══════════════════════════════════════════════════════════════
 
 function redirecionarParaHumano(numero) {
-  if (aguardandoHumano.has(numero)) return; // já redirecionado
+  if (aguardandoHumano.has(numero)) return;
   const liberaEm = Date.now() + MINUTOS_COM_HUMANO * 60 * 1000;
   aguardandoHumano.set(numero, liberaEm);
   salvarSessao();
@@ -364,18 +360,15 @@ function redirecionarParaHumano(numero) {
   log(`⏱️   LIA retoma automaticamente em ${MINUTOS_COM_HUMANO} minutos`);
   log(`💡  Para liberar antes: envie #liberar ${fmt} pelo WhatsApp`);
   log(`${"━".repeat(58)}\n`);
-
-  // Liberação gerenciada pelo verificador periódico (setInterval) — mais confiável que setTimeout
 }
 
 // ══════════════════════════════════════════════════════════════
 //  ⏱️  VERIFICADOR PERIÓDICO — libera clientes com timer expirado
-//  Roda a cada 2 minutos. Sobrevive a reinicializações e suspensão do PC.
 // ══════════════════════════════════════════════════════════════
-let _verificadorAtivo = false; // FIX 3: garante apenas 1 instância do setInterval
+let _verificadorAtivo = false;
 
 function iniciarVerificadorPeriodico() {
-  if (_verificadorAtivo) return; // já está rodando — ignora chamadas duplicadas
+  if (_verificadorAtivo) return;
   _verificadorAtivo = true;
   setInterval(() => {
     const agora = Date.now();
@@ -387,35 +380,41 @@ function iniciarVerificadorPeriodico() {
         aguardandoHumano.delete(numero);
         conversasIniciadas.delete(numero);
         etapaCliente[numero] = "menu";
+        // FIX #3: limpa histórico GPT ao expirar o timer do humano
+        delete historico[numero];
+        // FIX #2: remove número do Set de mídia ao liberar
+        avisadoMidia.delete(numero);
         liberados++;
         log(`🤖  LIA retomou atendimento de ${fmt} (timer expirado)`);
       }
     }
 
     for (const [numero, ts] of conversasIniciadas) {
-      if (ts <= agora) conversasIniciadas.delete(numero);
+      if (ts <= agora) {
+        conversasIniciadas.delete(numero);
+        // FIX #2: remove do avisadoMidia também ao expirar conversa
+        avisadoMidia.delete(numero);
+      }
     }
 
     if (liberados > 0) salvarSessao();
-  }, 2 * 60 * 1000); // verifica a cada 2 minutos
+  }, 2 * 60 * 1000);
 
   log("⏱️  Verificador periódico iniciado (intervalo: 2 min)");
 }
 
 // ══════════════════════════════════════════════════════════════
 //  🔓  LIBERAR CLIENTE MANUALMENTE (comando via WhatsApp)
-//  Como usar: envie  #liberar 5551999999999  pelo seu WhatsApp
 // ══════════════════════════════════════════════════════════════
 
 async function processarComandoAdmin(msg, texto) {
-  // Só aceita comandos vindos do próprio número autenticado (fromMe)
   if (!msg.key.fromMe) return false;
 
   const textoL = texto.trim().toLowerCase();
 
   if (textoL.startsWith("#liberar")) {
     const partes = texto.trim().split(/\s+/);
-    const alvo = partes[1]; // número sem formatação, ex: 5551999999999
+    const alvo = partes[1];
 
     if (!alvo) {
       await sockGlobal.sendMessage(msg.key.remoteJid, {
@@ -429,9 +428,13 @@ async function processarComandoAdmin(msg, texto) {
     const estaEmConversa = conversasIniciadas.has(numeroAlvo);
 
     if (estaAguardando || estaEmConversa) {
-      aguardandoHumano.delete(numeroAlvo);    // remove timer humano
-      conversasIniciadas.delete(numeroAlvo);  // FIX 1: remove bloqueio de conversa
+      aguardandoHumano.delete(numeroAlvo);
+      conversasIniciadas.delete(numeroAlvo);
       etapaCliente[numeroAlvo] = "menu";
+      // FIX #3: limpa histórico GPT ao liberar manualmente
+      delete historico[numeroAlvo];
+      // FIX #2: limpa avisadoMidia ao liberar manualmente
+      avisadoMidia.delete(numeroAlvo);
       salvarSessao();
       const nome = dadosCliente[numeroAlvo]?.nome || alvo;
       log(`🔓 [ADMIN] ${alvo} liberado manualmente — LIA retomará atendimento.\n`);
@@ -479,7 +482,6 @@ async function processarMensagem(numero, texto) {
   const textoN = texto.trim();
   const textoL = textoN.toLowerCase();
 
-  // ── MEMÓRIA DE LONGO PRAZO: Reseta p/ saudação se inativo > 24h
   const AGORA = Date.now();
   const ULTIMA = dados.ultimaInteracao || 0;
   if (ULTIMA > 0 && (AGORA - ULTIMA > 24 * 60 * 60 * 1000) && !aguardandoHumano.has(numero)) {
@@ -488,12 +490,11 @@ async function processarMensagem(numero, texto) {
   }
   dados.ultimaInteracao = AGORA;
   dadosCliente[numero] = dados;
-  // A sessão é salva nos retornos das etapas abaixo
 
   // ── Palavra-chave: voltar ao menu ────────────────────────────
   if (["menu", "inicio", "início", "voltar", "0"].includes(textoL) && etapa !== "novo") {
     etapaCliente[numero] = "menu";
-    historico[numero] = []; // MELHORIA: limpa histórico GPT ao voltar ao menu
+    historico[numero] = [];
     salvarSessao();
     return menuPrincipal(dados.nome || "");
   }
@@ -501,7 +502,6 @@ async function processarMensagem(numero, texto) {
   // ── NOVO CLIENTE ou CLIENTE RETORNANDO (boas-vindas) ───────────
   if (etapa === "novo") {
     if (dados.nome) {
-      // Cliente antigo voltando após 24h
       etapaCliente[numero] = "menu";
       historico[numero] = [];
       salvarSessao();
@@ -518,9 +518,8 @@ async function processarMensagem(numero, texto) {
         `_Digite o número da opção desejada ou_ *faça sua pergunta diretamente* _que responderei na hora!_ 💬`
       );
     } else {
-      // Cliente totalmente novo — salva primeira mensagem como contexto
       etapaCliente[numero] = "coletando_nome";
-      dadosCliente[numero] = { ...dados, primeiraMensagem: textoN }; // FIX 2b: contexto inicial
+      dadosCliente[numero] = { ...dados, primeiraMensagem: textoN };
       historico[numero] = [];
       salvarSessao();
       return (
@@ -533,8 +532,6 @@ async function processarMensagem(numero, texto) {
 
   // ── COLETA NOME ──────────────────────────────────────────────
   if (etapa === "coletando_nome") {
-
-    // FIX 2: Valida se a resposta é realmente um nome via GPT (temperatura 0 = determinístico)
     const promptNome = `O cliente respondeu: "${textoN}"
 Extraia APENAS o primeiro nome ou nome completo da pessoa.
 Regras:
@@ -553,7 +550,6 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
       });
       nomeExtraido = resNome.choices[0].message.content.trim();
     } catch (e) {
-      // Se GPT falhar, usa fallback simples
       nomeExtraido = textoN.split(" ").slice(0, 2).join(" ");
     }
 
@@ -573,7 +569,6 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
     log(`\n📋 Novo cliente: ${nome} | WA: ${numero.replace("@s.whatsapp.net", "")}\n`);
 
-    // Se o cliente enviou contexto antes do nome, usa como ponto de partida
     if (primeiraMensagem) {
       historico[numero] = [];
       const respostaContexto = await chamarGPT(numero, `Meu nome é ${nome}. ${primeiraMensagem}`, "geral");
@@ -588,7 +583,7 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
   // ── MENU PRINCIPAL ───────────────────────────────────────────
   if (etapa === "menu") {
-    const opcao = textoN.trim().replace(/[^1-6]/g, "").slice(0, 1); // aceita apenas 1 dígito
+    const opcao = textoN.trim().replace(/[^1-6]/g, "").slice(0, 1);
 
     if (opcao === "1") {
       etapaCliente[numero] = "orcamento";
@@ -613,15 +608,18 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
       );
     }
 
+    // FIX #4 (race condition opção 3): envia mensagem de status ANTES de redirecionar
+    // para garantir que o cliente receba a resposta mesmo com a guarda dupla ativa.
     if (opcao === "3") {
       etapaCliente[numero] = "status";
-      redirecionarParaHumano(numero); // redireciona ANTES do GPT para evitar duplo acionamento
-      salvarSessao(); // FIX 5: persiste etapa "status" imediatamente
+      salvarSessao();
+      // Retorna primeiro; o redirecionamento é feito no handler externo após o envio
       return (
         `*Status do Equipamento* 🔍\n\n` +
-        `Para verificar o andamento do seu equipamento, precisarei redirecionar ` +
-        `você para um de nossos atendentes que consultará diretamente no sistema.\n\n` +
-        `⏳ Por favor, *aguarde um momento*. Em breve retornaremos! 🙏`
+        `Para verificar o andamento do seu equipamento, precisarei acionar ` +
+        `um de nossos atendentes que consultará diretamente no sistema.\n\n` +
+        `⏳ Por favor, *aguarde um momento*. Em breve retornaremos! 🙏\n\n` +
+        `_Você receberá uma confirmação assim que um atendente estiver disponível._`
       );
     }
 
@@ -664,13 +662,19 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
       );
     }
 
-    // Sem opção válida → reexibe menu orientando o cliente
+    // FIX #5: Distingue texto livre (pergunta) de número inválido
+    // Se o texto contém apenas dígitos mas nenhum válido (1-6) → orienta o cliente
+    // Se o texto é uma pergunta livre → responde via GPT geral sem exigir opção
     if (!opcao) {
-      return menuPrincipal(dados.nome || "") +
-        `\n\n_Por favor, digite apenas o *número* da opção desejada (1 a 6)._`;
+      const somenteDigitos = /^\d+$/.test(textoN.trim());
+      if (somenteDigitos) {
+        return menuPrincipal(dados.nome || "") +
+          `\n\n_Por favor, escolha uma opção de *1 a 6*._`;
+      }
+      // Pergunta livre no menu → GPT geral, permanece no menu
+      return await chamarGPT(numero, textoN, "geral");
     }
 
-    // Texto livre com número (não deveria chegar aqui) → GPT geral
     return await chamarGPT(numero, textoN, "geral");
   }
 
@@ -685,7 +689,6 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
   const contexto = mapaContexto[etapa] || "geral";
 
-  // Coleta equipamento automaticamente nos fluxos de orçamento/problema
   if (["orcamento", "problema"].includes(etapa) && !dados.equipamento) {
     dadosCliente[numero] = { ...dados, equipamento: textoN.slice(0, 80) };
     salvarSessao();
@@ -693,8 +696,12 @@ Retorne APENAS o nome ou NAO_IDENTIFICADO, sem mais nenhum texto.`;
 
   const resposta = await chamarGPT(numero, textoN, contexto);
 
-  if (["orcamento", "agendamento"].includes(etapa)) {
-    etapaCliente[numero] = "atendendo";
+  // FIX #6: Após resposta GPT em fluxos de orçamento/agendamento/problema,
+  // retorna ao menu para evitar que o cliente fique preso na etapa "atendendo"
+  // indefinidamente. A etapa muda para "menu" somente após a primeira resposta
+  // satisfatória, sinalizando que o tópico principal foi tratado.
+  if (["orcamento", "agendamento", "problema"].includes(etapa)) {
+    etapaCliente[numero] = "menu";
     salvarSessao();
   }
 
@@ -721,7 +728,7 @@ async function iniciarBot() {
     retryRequestDelayMs: 2000,
   });
 
-  sockGlobal = sock; // referência global para comandos admin
+  sockGlobal = sock;
 
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
     if (qr) {
@@ -744,7 +751,6 @@ async function iniciarBot() {
       log("  🛑  Parar: Ctrl + C");
       console.log("═".repeat(58) + "\n");
 
-      // Inicia verificador periódico de timers
       iniciarVerificadorPeriodico();
     }
 
@@ -770,10 +776,9 @@ async function iniciarBot() {
 
     const numero = msg.key.remoteJid;
 
-    // ── FILTROS: ignora grupos, status e broadcast ────────────
     if (!numero) return;
-    if (numero.endsWith("@g.us")) return; // grupos
-    if (numero === "status@broadcast") return; // ignora status do WhatsApp
+    if (numero.endsWith("@g.us")) return;
+    if (numero === "status@broadcast") return;
 
     const texto =
       msg.message?.conversation ||
@@ -786,16 +791,13 @@ async function iniciarBot() {
 
     // ── MENSAGENS ENVIADAS POR VOCÊ (atendente humano) ──────────
     if (msg.key.fromMe) {
-      // Verifica se é um comando (#liberar, #lista etc.)
       if (texto) {
         const foiComando = await processarComandoAdmin(msg, texto);
         if (foiComando) return;
       }
 
-      // Silencia o bot automaticamente ao responder para um cliente
-      // Expira junto com o timer do atendimento humano
       const expiraEm = Date.now() + MINUTOS_COM_HUMANO * 60 * 1000;
-      conversasIniciadas.set(numero, expiraEm); // Map: número → timestamp de expiração
+      conversasIniciadas.set(numero, expiraEm);
       if (!aguardandoHumano.has(numero)) {
         redirecionarParaHumano(numero);
         log(`👨‍💼 [${hora}] Você iniciou conversa com ${fmt} — bot silenciado automaticamente`);
@@ -804,7 +806,7 @@ async function iniciarBot() {
       return;
     }
 
-    // ── CLIENTE RESPONDEU conversa iniciada por você — bot silencia (enquanto não expirar) ──
+    // ── CLIENTE RESPONDEU conversa iniciada por você ──────────
     const tsConversa = conversasIniciadas.get(numero);
     if ((tsConversa && tsConversa > Date.now()) || aguardandoHumano.has(numero)) {
       const restam = aguardandoHumano.has(numero)
@@ -813,16 +815,15 @@ async function iniciarBot() {
       log(`👤 [${hora}] ${fmt} respondeu conversa humana (~${restam} min restantes) — bot silenciado`);
       return;
     }
-    // Limpa entrada expirada do Map
     if (tsConversa) conversasIniciadas.delete(numero);
 
-    // ── RATE LIMIT — proteção anti-flood (texto E mídia) ─────
+    // ── RATE LIMIT ─────────────────────────────────────────────
     if (verificarRateLimit(numero)) {
       log(`🚫 [${hora}] ${fmt} bloqueado por flood (>${RATE_LIMIT_MAX} msgs/${RATE_LIMIT_SECS}s)`);
       return;
     }
 
-    // ── MÍDIA (foto, áudio, vídeo, documento) → redireciona ──
+    // ── MÍDIA → redireciona ────────────────────────────────────
     if (!texto) {
       if (!aguardandoHumano.has(numero)) {
         redirecionarParaHumano(numero);
@@ -833,8 +834,10 @@ async function iniciarBot() {
           text:
             `Olá! Sou a *LIA*, Atendente Virtual da *Infohouse Informática*. 😊\n\n` +
             `Recebemos sua mensagem! Para conteúdos como *fotos e áudios*, ` +
-            `vou direcionar você para um de nossos atendentes.\n\n` +
-            `⏳ Por favor, *aguarde um momento*. Em breve alguém irá atendê-lo(a) por aqui. 🙏`,
+            `vou direcionar você para um de nossos atendentes.
+
+` +
+            `⏳ Por favor, *aguarde um momento*. Em breve alguém irá atendê-lo(a) por aqui. 🙏",
         });
       }
       log(`📎 [${hora}] ${fmt} enviou mídia — redirecionado para atendente humano`);
@@ -855,7 +858,6 @@ async function iniciarBot() {
       return;
     }
 
-    // ── DENTRO DO HORÁRIO: limpa flag fora-horário ───────────
     avisadoForaHorario.delete(numero);
 
     try {
@@ -863,8 +865,7 @@ async function iniciarBot() {
 
       const resposta = await processarMensagem(numero, texto);
 
-      // ── GUARDA DUPLA: verifica novamente se o humano assumiu
-      //    DURANTE o tempo que o GPT estava processando (race condition)
+      // ── Guarda dupla: verifica se humano assumiu durante processamento
       const tsConv = conversasIniciadas.get(numero);
       if (aguardandoHumano.has(numero) || (tsConv && tsConv > Date.now())) {
         await sock.sendPresenceUpdate("paused", numero);
@@ -872,7 +873,13 @@ async function iniciarBot() {
         return;
       }
 
-      // Simula digitação (mín 1s, máx 5s, baseado no tamanho da resposta)
+      // FIX #4 (race condition opção 3): redireciona APÓS garantir o envio da mensagem
+      // Detecta etapa "status" recém-definida e aciona redirecionamento aqui,
+      // depois que a resposta já foi preparada (fora do alcance da guarda dupla acima).
+      if (etapaCliente[numero] === "status" && !aguardandoHumano.has(numero)) {
+        redirecionarParaHumano(numero);
+      }
+
       const delay = Math.min(Math.max(resposta.length * 25, 1000), 5000);
       await new Promise(r => setTimeout(r, delay));
 
@@ -883,25 +890,18 @@ async function iniciarBot() {
     } catch (err) {
       log(`❌ [ERRO] ${fmt} — ${err.message}`);
 
-      // Mensagem ao cliente diferenciada por tipo de erro
       let msgErro;
       if (err.status === 429 || err.message?.includes("quota") || err.message?.includes("rate limit")) {
         msgErro =
-          "Estou com muitas solicitações no momento. 😕
-
-" +
+          "Estou com muitas solicitações no momento. 😕\n\n" +
           "Por favor, *aguarde 1 minuto* e tente novamente, ou escolha *6️⃣ Falar com atendente*. 🙏";
       } else if (err.message?.includes("network") || err.message?.includes("ECONNREFUSED") || err.message?.includes("fetch")) {
         msgErro =
-          "Estou com dificuldades de conexão no momento. 😕
-
-" +
+          "Estou com dificuldades de conexão no momento. 😕\n\n" +
           "Por favor, *tente novamente em instantes* ou escolha *6️⃣ Falar com atendente*. 🙏";
       } else {
         msgErro =
-          "Ocorreu um problema inesperado. 😕
-
-" +
+          "Ocorreu um problema inesperado. 😕\n\n" +
           "Por favor, *tente novamente* ou escolha *6️⃣ Falar com atendente* para atendimento imediato. 🙏";
       }
 
