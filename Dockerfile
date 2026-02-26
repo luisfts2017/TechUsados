@@ -19,7 +19,6 @@ RUN addgroup -S lia && adduser -S lia -G lia
 
 COPY --from=builder /app/node_modules ./node_modules
 COPY src ./src
-COPY "bot (2).js" "./bot (2).js"
 COPY package*.json ./
 
 # Create necessary directories

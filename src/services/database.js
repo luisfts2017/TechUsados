@@ -358,7 +358,7 @@ function clearHistorico(numero) {
 function limparDadosInativos(diasInatividade = 90) {
   if (!db) return 0;
   const limite = Date.now() - diasInatividade * 24 * 60 * 60 * 1000;
-  const result = db.prepare("DELETE FROM clientes WHERE ultima_interacao > 0 AND ultima_interacao < ?").run(limite);
+  const result = db.prepare("DELETE FROM clientes WHERE ultima_interacao IS NOT NULL AND ultima_interacao > 0 AND ultima_interacao < ?").run(limite);
   return result.changes;
 }
 

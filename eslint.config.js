@@ -28,6 +28,6 @@ module.exports = [
       "no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],
       "no-console": "off",
     },
-    ignores: ["node_modules/**", "tests/**"],
+    ignores: ["node_modules/**", "coverage/**"],
   },
 ];

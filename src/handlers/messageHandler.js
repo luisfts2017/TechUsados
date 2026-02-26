@@ -2,7 +2,7 @@
 
 const {
   getEtapa, setEtapa, getDadosCliente, setDadosCliente,
-  hasAguardandoHumano, setAguardandoHumano, deleteAguardandoHumano, deleteConversaIniciada,
+  hasAguardandoHumano, setAguardandoHumano, getAguardandoHumano, deleteAguardandoHumano, deleteConversaIniciada,
   getConversaIniciada, setConversaIniciada,
   clearHistorico, deleteAvisadoMidia, deleteAvisadoForaHorario,
   getAllAguardandoHumano, hasAvisadoMidia,
@@ -73,9 +73,11 @@ async function processarMensagem(sock, msg) {
 
   // ── Cliente respondeu conversa iniciada por você
   const tsConversa = await getConversaIniciada(numero);
-  if ((tsConversa && tsConversa > Date.now()) || await hasAguardandoHumano(numero)) {
-    const restam = await hasAguardandoHumano(numero)
-      ? Math.ceil(((await hasAguardandoHumano(numero)) - Date.now()) / 60000)
+  const aguardandoHumano = await hasAguardandoHumano(numero);
+  if ((tsConversa && tsConversa > Date.now()) || aguardandoHumano) {
+    const tsAguardando = aguardandoHumano ? await getAguardandoHumano(numero) : null;
+    const restam = tsAguardando
+      ? Math.ceil((tsAguardando - Date.now()) / 60000)
       : Math.ceil((tsConversa - Date.now()) / 60000);
     logger.debug("Cliente em conversa humana — bot silenciado", { numero: fmt });
     return;
@@ -127,7 +129,7 @@ async function processarMensagem(sock, msg) {
       const resposta = await processarFluxo(numero, texto, etapaAtual, dadosAtual);
 
       // Verifica se humano assumiu durante processamento
-      if (await hasAguardandoHumano(numero) || await getConversaIniciada(numero) > Date.now()) {
+      if (await hasAguardandoHumano(numero) || (await getConversaIniciada(numero)) > Date.now()) {
         await sock.sendPresenceUpdate("paused", numero);
         logger.debug("Resposta descartada — humano assumiu", { numero: fmt });
         return;
