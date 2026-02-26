@@ -834,10 +834,8 @@ async function iniciarBot() {
           text:
             `Olá! Sou a *LIA*, Atendente Virtual da *Infohouse Informática*. 😊\n\n` +
             `Recebemos sua mensagem! Para conteúdos como *fotos e áudios*, ` +
-            `vou direcionar você para um de nossos atendentes.
-
-` +
-            `⏳ Por favor, *aguarde um momento*. Em breve alguém irá atendê-lo(a) por aqui. 🙏",
+            `vou direcionar você para um de nossos atendentes.\n\n` +
+            `⏳ Por favor, *aguarde um momento*. Em breve alguém irá atendê-lo(a) por aqui. 🙏`,
         });
       }
       log(`📎 [${hora}] ${fmt} enviou mídia — redirecionado para atendente humano`);
