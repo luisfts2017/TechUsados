@@ -1,0 +1,9 @@
+node_modules
+.git
+.env
+logs
+data
+sessao_whatsapp
+*.md
+tests
+.eslintrc*
